@@ -23,8 +23,6 @@ private[akka] class ClusterReadView(cluster: Cluster) extends Closeable {
    */
   @volatile
   private var state: CurrentClusterState = CurrentClusterState()
-  @volatile
-  private var _convergence = false
 
   /**
    * Current internal cluster stats, updated periodically via event bus.
@@ -50,7 +48,6 @@ private[akka] class ClusterReadView(cluster: Cluster) extends Closeable {
         case e: ClusterDomainEvent ⇒ e match {
           case SeenChanged(convergence, seenBy) ⇒
             state = state.copy(seenBy = seenBy)
-            _convergence = convergence
           case MemberRemoved(member) ⇒
             state = state.copy(members = state.members - member, unreachable = state.unreachable - member)
           case UnreachableMember(member) ⇒

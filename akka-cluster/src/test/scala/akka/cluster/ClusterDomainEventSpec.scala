@@ -44,7 +44,7 @@ class ClusterDomainEventSpec extends WordSpec with MustMatchers {
       val (g1, _) = converge(Gossip(members = SortedSet(a1)))
       val (g2, s2) = converge(Gossip(members = SortedSet(a1, b1, e1)))
 
-      diffConverged(g1, g2) must be(Seq(MemberUp(b1), MemberJoined(e1)))
+      diffMemberEvents(g1, g2) must be(Seq(MemberUp(b1), MemberJoined(e1)))
       diffUnreachable(g1, g2) must be(Seq.empty)
       diffSeen(g1, g2) must be(Seq(SeenChanged(convergence = true, seenBy = s2)))
     }
@@ -53,25 +53,16 @@ class ClusterDomainEventSpec extends WordSpec with MustMatchers {
       val (g1, _) = converge(Gossip(members = SortedSet(a2, b1, c2)))
       val (g2, s2) = converge(Gossip(members = SortedSet(a1, b1, c1, e1)))
 
-      diffConverged(g1, g2) must be(Seq(MemberUp(a1), MemberLeft(c1), MemberJoined(e1)))
+      diffMemberEvents(g1, g2) must be(Seq(MemberUp(a1), MemberLeft(c1), MemberJoined(e1)))
       diffUnreachable(g1, g2) must be(Seq.empty)
       diffSeen(g1, g2) must be(Seq(SeenChanged(convergence = true, seenBy = s2)))
     }
 
-    "be produced for unreachable members" in {
-      val g1 = Gossip(members = SortedSet(a1, b1), overview = GossipOverview(unreachable = Set(c2)))
-      val g2 = Gossip(members = SortedSet(a1), overview = GossipOverview(unreachable = Set(b1, c2)))
-
-      diffConverged(g1, g2) must be(Seq.empty)
-      diffUnreachable(g1, g2) must be(Seq(UnreachableMember(b1)))
-      diffSeen(g1, g2) must be(Seq.empty)
-    }
-
-    "not produce MemberEvents for members in unreachable" in {
+    "be produced for members in unreachable" in {
       val g1 = Gossip(members = SortedSet(a1, b1), overview = GossipOverview(unreachable = Set(c2, e2)))
       val g2 = Gossip(members = SortedSet(a1), overview = GossipOverview(unreachable = Set(c2, b3, e3)))
 
-      diffConverged(g1, g2) must be(Seq.empty)
+      diffMemberEvents(g1, g2) must be(Seq(MemberDowned(b3), MemberDowned(e3)))
       diffUnreachable(g1, g2) must be(Seq(UnreachableMember(b3)))
       diffSeen(g1, g2) must be(Seq.empty)
     }
@@ -80,7 +71,7 @@ class ClusterDomainEventSpec extends WordSpec with MustMatchers {
       val (g1, _) = converge(Gossip(members = SortedSet(a1, b1)))
       val (g2, _) = converge(Gossip(members = SortedSet(a1, b1), overview = GossipOverview(unreachable = Set(e3))))
 
-      diffConverged(g1, g2) must be(Seq(MemberDowned(e3)))
+      diffMemberEvents(g1, g2) must be(Seq(MemberDowned(e3)))
       diffUnreachable(g1, g2) must be(Seq(UnreachableMember(e3)))
       diffSeen(g1, g2) must be(Seq.empty)
     }
@@ -89,7 +80,7 @@ class ClusterDomainEventSpec extends WordSpec with MustMatchers {
       val (g1, _) = converge(Gossip(members = SortedSet(a1, d1)))
       val (g2, s2) = converge(Gossip(members = SortedSet(a1)))
 
-      diffConverged(g1, g2) must be(Seq(MemberRemoved(d2)))
+      diffMemberEvents(g1, g2) must be(Seq(MemberRemoved(d2)))
       diffUnreachable(g1, g2) must be(Seq.empty)
       diffSeen(g1, g2) must be(Seq(SeenChanged(convergence = true, seenBy = s2)))
     }
@@ -98,10 +89,10 @@ class ClusterDomainEventSpec extends WordSpec with MustMatchers {
       val g1 = Gossip(members = SortedSet(a1, b1, e1)).seen(a1.address).seen(b1.address).seen(e1.address)
       val g2 = Gossip(members = SortedSet(a1, b1, e1)).seen(a1.address).seen(b1.address)
 
-      diffConverged(g1, g2) must be(Seq.empty)
+      diffMemberEvents(g1, g2) must be(Seq.empty)
       diffUnreachable(g1, g2) must be(Seq.empty)
       diffSeen(g1, g2) must be(Seq(SeenChanged(convergence = false, seenBy = Set(a1.address, b1.address))))
-      diffConverged(g2, g1) must be(Seq.empty)
+      diffMemberEvents(g2, g1) must be(Seq.empty)
       diffUnreachable(g2, g1) must be(Seq.empty)
       diffSeen(g2, g1) must be(Seq(SeenChanged(convergence = true, seenBy = Set(a1.address, b1.address, e1.address))))
     }
@@ -110,9 +101,10 @@ class ClusterDomainEventSpec extends WordSpec with MustMatchers {
       val (g1, _) = converge(Gossip(members = SortedSet(a1, b1, e1)))
       val (g2, s2) = converge(Gossip(members = SortedSet(b1, e1)))
 
-      diffConverged(g1, g2) must be(Seq(LeaderChanged(Some(b1.address)), MemberRemoved(a3)))
+      diffMemberEvents(g1, g2) must be(Seq(MemberRemoved(a3)))
       diffUnreachable(g1, g2) must be(Seq.empty)
       diffSeen(g1, g2) must be(Seq(SeenChanged(convergence = true, seenBy = s2)))
+      diffLeader(g1, g2) must be(Seq(LeaderChanged(Some(b1.address))))
     }
   }
 }
