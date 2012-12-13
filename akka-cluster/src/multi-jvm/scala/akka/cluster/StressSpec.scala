@@ -5,6 +5,7 @@ package akka.cluster
 
 import language.postfixOps
 import scala.concurrent.duration._
+import scala.concurrent.forkjoin.ThreadLocalRandom
 import org.scalatest.BeforeAndAfterEach
 import com.typesafe.config.ConfigFactory
 import akka.actor.Actor
@@ -23,6 +24,7 @@ import akka.testkit._
 import akka.routing.CurrentRoutees
 import akka.routing.RouterRoutees
 import akka.actor.PoisonPill
+import com.typesafe.config.Config
 
 object StressMultiJvmSpec extends MultiNodeConfig {
 
@@ -46,6 +48,7 @@ object StressMultiJvmSpec extends MultiNodeConfig {
       nr-of-nodes-shutdown = 2
       work-batch-size = 100
       work-batch-interval = 2s
+      payload-size = 1000
       normal-throughput-duration = 30s
       high-throughput-duration = 10s
       report-metrics-interval = 10s
@@ -91,6 +94,53 @@ object StressMultiJvmSpec extends MultiNodeConfig {
       }
     }
     """))
+
+  class Settings(conf: Config) {
+    val testConfig = conf.getConfig("akka.test.cluster-stress-spec")
+
+    val numberOfNodesFactor = testConfig.getInt("nr-of-nodes-factor")
+    val totalNumberOfNodes = testConfig.getInt("nr-of-nodes") * numberOfNodesFactor ensuring (
+      _ >= 10, "nr-of-nodes must be >= 10")
+    val numberOfSeedNodes = testConfig.getInt("nr-of-seed-nodes") // not multiplied by numberOfNodesFactor
+    val numberOfNodesJoiningToSeedNodesInitially =
+      testConfig.getInt("nr-of-nodes-joining-to-seed-initally") * numberOfNodesFactor
+    val numberOfNodesJoiningOneByOneSmall =
+      testConfig.getInt("nr-of-nodes-joining-one-by-one-small") * numberOfNodesFactor
+    val numberOfNodesJoiningOneByOneLarge =
+      testConfig.getInt("nr-of-nodes-joining-one-by-one-large") * numberOfNodesFactor
+    val numberOfNodesJoiningToOneNode =
+      testConfig.getInt("nr-of-nodes-joining-to-one") * numberOfNodesFactor
+    val numberOfNodesJoiningToSeedNodes =
+      testConfig.getInt("nr-of-nodes-joining-to-seed") * numberOfNodesFactor
+    val numberOfNodesLeavingOneByOneSmall =
+      testConfig.getInt("nr-of-nodes-leaving-one-by-one-small") * numberOfNodesFactor
+    val numberOfNodesLeavingOneByOneLarge =
+      testConfig.getInt("nr-of-nodes-leaving-one-by-one-large") * numberOfNodesFactor
+    val numberOfNodesLeaving =
+      testConfig.getInt("nr-of-nodes-leaving") * numberOfNodesFactor
+    val numberOfNodesShutdownOneByOneSmall =
+      testConfig.getInt("nr-of-nodes-shutdown-one-by-one-small") * numberOfNodesFactor
+    val numberOfNodesShutdownOneByOneLarge =
+      testConfig.getInt("nr-of-nodes-shutdown-one-by-one-large") * numberOfNodesFactor
+    val numberOfNodesShutdown =
+      testConfig.getInt("nr-of-nodes-shutdown") * numberOfNodesFactor
+
+    val workBatchSize = testConfig.getInt("work-batch-size")
+    val workBatchInterval = Duration(testConfig.getMilliseconds("work-batch-interval"), MILLISECONDS)
+    val payloadSize = testConfig.getInt("payload-size")
+    val normalThroughputDuration = Duration(testConfig.getMilliseconds("normal-throughput-duration"), MILLISECONDS)
+    val highThroughputDuration = Duration(testConfig.getMilliseconds("high-throughput-duration"), MILLISECONDS)
+    val reportMetricsInterval = Duration(testConfig.getMilliseconds("report-metrics-interval"), MILLISECONDS)
+
+    require(numberOfSeedNodes + numberOfNodesJoiningToSeedNodesInitially + numberOfNodesJoiningOneByOneSmall +
+      numberOfNodesJoiningOneByOneLarge + numberOfNodesJoiningToOneNode + numberOfNodesJoiningToSeedNodes <= totalNumberOfNodes,
+      s"specified number of joining nodes <= ${totalNumberOfNodes}")
+
+    // don't shutdown the 3 nodes hosting the master actors
+    require(numberOfNodesLeavingOneByOneSmall + numberOfNodesLeavingOneByOneLarge + numberOfNodesLeaving +
+      numberOfNodesShutdownOneByOneSmall + numberOfNodesShutdownOneByOneLarge + numberOfNodesShutdown <= totalNumberOfNodes - 3,
+      s"specified number of leaving/shutdown nodes <= ${totalNumberOfNodes - 3}")
+  }
 
   // FIXME configurable number of nodes
   for (n ← 1 to 13) role("node-" + n)
@@ -166,8 +216,9 @@ object StressMultiJvmSpec extends MultiNodeConfig {
     }
   }
 
-  class Master(val batchSize: Int, val batchInterval: FiniteDuration) extends Actor {
+  class Master(settings: StressMultiJvmSpec.Settings, batchInterval: FiniteDuration) extends Actor {
     val workers = context.actorOf(Props[Worker].withRouter(FromConfig), "workers")
+    val payload = Array.fill(settings.payloadSize)(ThreadLocalRandom.current.nextInt(127).toByte)
     var idCounter = 0L
     def nextId(): JobId = {
       idCounter += 1
@@ -198,11 +249,11 @@ object StressMultiJvmSpec extends MultiNodeConfig {
       case Ack(id) ⇒
         outstanding -= id
         ackCounter += 1
-        if (outstanding.size == batchSize / 2)
+        if (outstanding.size == settings.workBatchSize / 2)
           if (batchInterval == Duration.Zero) self ! SendBatch
           else context.system.scheduler.scheduleOnce(batchInterval, self, SendBatch)
       case SendBatch ⇒
-        if (outstanding.size < batchSize)
+        if (outstanding.size < settings.workBatchSize)
           sendJobs()
       case RetryTick ⇒ resend()
       case End ⇒
@@ -226,9 +277,8 @@ object StressMultiJvmSpec extends MultiNodeConfig {
     }
 
     def sendJobs(): Unit = {
-      0 until batchSize foreach { _ ⇒
-        // FIXME payload size should be configurable
-        send(Job(nextId(), "payload"))
+      0 until settings.workBatchSize foreach { _ ⇒
+        send(Job(nextId(), payload))
       }
     }
 
@@ -261,7 +311,7 @@ object StressMultiJvmSpec extends MultiNodeConfig {
   case object ReportTick
   case object SendBatch
   type JobId = Long
-  case class Job(id: JobId, payload: String)
+  case class Job(id: JobId, payload: Any)
   case class Ack(id: JobId)
   case class JobState(deadline: Deadline, job: Job)
   case class WorkResult(duration: Duration, sendCount: Long, ackCount: Long) {
@@ -292,60 +342,15 @@ abstract class StressSpec
   import StressMultiJvmSpec._
   import ClusterEvent._
 
+  val settings = new Settings(system.settings.config)
+  import settings._
+
   var step = 0
   var usedRoles = 0
 
   override def beforeEach(): Unit = { step += 1 }
 
-  object Settings {
-    val testConfig = system.settings.config.getConfig("akka.test.cluster-stress-spec")
-
-    val numberOfNodesFactor = testConfig.getInt("nr-of-nodes-factor")
-    val totalNumberOfNodes = testConfig.getInt("nr-of-nodes") * numberOfNodesFactor ensuring (
-      _ >= 10, "nr-of-nodes must be >= 10")
-    val numberOfSeedNodes = testConfig.getInt("nr-of-seed-nodes") // not multiplied by numberOfNodesFactor
-    val numberOfNodesJoiningToSeedNodesInitially =
-      testConfig.getInt("nr-of-nodes-joining-to-seed-initally") * numberOfNodesFactor
-    val numberOfNodesJoiningOneByOneSmall =
-      testConfig.getInt("nr-of-nodes-joining-one-by-one-small") * numberOfNodesFactor
-    val numberOfNodesJoiningOneByOneLarge =
-      testConfig.getInt("nr-of-nodes-joining-one-by-one-large") * numberOfNodesFactor
-    val numberOfNodesJoiningToOneNode =
-      testConfig.getInt("nr-of-nodes-joining-to-one") * numberOfNodesFactor
-    val numberOfNodesJoiningToSeedNodes =
-      testConfig.getInt("nr-of-nodes-joining-to-seed") * numberOfNodesFactor
-    val numberOfNodesLeavingOneByOneSmall =
-      testConfig.getInt("nr-of-nodes-leaving-one-by-one-small") * numberOfNodesFactor
-    val numberOfNodesLeavingOneByOneLarge =
-      testConfig.getInt("nr-of-nodes-leaving-one-by-one-large") * numberOfNodesFactor
-    val numberOfNodesLeaving =
-      testConfig.getInt("nr-of-nodes-leaving") * numberOfNodesFactor
-    val numberOfNodesShutdownOneByOneSmall =
-      testConfig.getInt("nr-of-nodes-shutdown-one-by-one-small") * numberOfNodesFactor
-    val numberOfNodesShutdownOneByOneLarge =
-      testConfig.getInt("nr-of-nodes-shutdown-one-by-one-large") * numberOfNodesFactor
-    val numberOfNodesShutdown =
-      testConfig.getInt("nr-of-nodes-shutdown") * numberOfNodesFactor
-
-    val workBatchSize = testConfig.getInt("work-batch-size")
-    val workBatchInterval = Duration(testConfig.getMilliseconds("work-batch-interval"), MILLISECONDS)
-    val normalThroughputDuration = Duration(testConfig.getMilliseconds("normal-throughput-duration"), MILLISECONDS)
-    val highThroughputDuration = Duration(testConfig.getMilliseconds("high-throughput-duration"), MILLISECONDS)
-    val reportMetricsInterval = Duration(testConfig.getMilliseconds("report-metrics-interval"), MILLISECONDS)
-
-    require(numberOfSeedNodes + numberOfNodesJoiningToSeedNodesInitially + numberOfNodesJoiningOneByOneSmall +
-      numberOfNodesJoiningOneByOneLarge + numberOfNodesJoiningToOneNode + numberOfNodesJoiningToSeedNodes <= totalNumberOfNodes,
-      s"specified number of joining nodes <= ${totalNumberOfNodes}")
-
-    // don't shutdown the 3 nodes hosting the master actors
-    require(numberOfNodesLeavingOneByOneSmall + numberOfNodesLeavingOneByOneLarge + numberOfNodesLeaving +
-      numberOfNodesShutdownOneByOneSmall + numberOfNodesShutdownOneByOneLarge + numberOfNodesShutdown <= totalNumberOfNodes - 3,
-      s"specified number of leaving/shutdown nodes <= ${totalNumberOfNodes - 3}")
-  }
-
-  import Settings._
-
-  val seedNodes = roles.take(Settings.numberOfSeedNodes)
+  val seedNodes = roles.take(numberOfSeedNodes)
 
   override def cluster: Cluster = {
     createWorker
@@ -486,7 +491,7 @@ abstract class StressSpec
       val (masterRoles, otherRoles) = roles.take(usedRoles).splitAt(3)
       runOn(masterRoles: _*) {
         reportResult {
-          val m = system.actorOf(Props(new Master(workBatchSize, batchInterval)), "master-" + myself.name)
+          val m = system.actorOf(Props(new Master(settings, batchInterval)), "master-" + myself.name)
           m ! Begin
           import system.dispatcher
           system.scheduler.scheduleOnce(highThroughputDuration) {
@@ -545,7 +550,7 @@ abstract class StressSpec
 
     "start routers that are running while nodes are joining" taggedAs LongRunningTest in {
       runOn(roles.take(3): _*) {
-        system.actorOf(Props(new Master(workBatchSize, workBatchInterval)), "master-" + myself.name) ! Begin
+        system.actorOf(Props(new Master(settings, settings.workBatchInterval)), "master-" + myself.name) ! Begin
       }
       enterBarrier("after-" + step)
     }
@@ -598,7 +603,7 @@ abstract class StressSpec
 
     "start routers that are running while nodes are removed" taggedAs LongRunningTest in {
       runOn(roles.take(3): _*) {
-        system.actorOf(Props(new Master(workBatchSize, workBatchInterval)), "master-" + myself.name) ! Begin
+        system.actorOf(Props(new Master(settings, settings.workBatchInterval)), "master-" + myself.name) ! Begin
       }
       enterBarrier("after-" + step)
     }
