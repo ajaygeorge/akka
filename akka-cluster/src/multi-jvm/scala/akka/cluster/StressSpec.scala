@@ -14,6 +14,8 @@ import akka.actor.ActorRef
 import akka.actor.Address
 import akka.actor.Props
 import akka.actor.Terminated
+import akka.actor.OneForOneStrategy
+import akka.actor.SupervisorStrategy._
 import akka.cluster.StandardMetrics.Cpu
 import akka.cluster.StandardMetrics.HeapMemory
 import akka.cluster.ClusterEvent.ClusterMetricsChanged
@@ -21,11 +23,15 @@ import akka.remote.testkit.MultiNodeConfig
 import akka.remote.testkit.MultiNodeSpec
 import akka.routing.FromConfig
 import akka.testkit._
+import akka.testkit.TestEvent._
 import akka.routing.CurrentRoutees
 import akka.routing.RouterRoutees
 import akka.actor.PoisonPill
 import com.typesafe.config.Config
 import akka.actor.RootActorPath
+import akka.actor.Deploy
+import akka.remote.RemoteScope
+import akka.actor.ActorSystem
 
 object StressMultiJvmSpec extends MultiNodeConfig {
 
@@ -50,8 +56,10 @@ object StressMultiJvmSpec extends MultiNodeConfig {
       work-batch-size = 100
       work-batch-interval = 2s
       payload-size = 1000
+      duration-factor = 1
       normal-throughput-duration = 30s
       high-throughput-duration = 10s
+      supervision-duration = 10s
       report-metrics-interval = 10s
     }
 
@@ -97,41 +105,46 @@ object StressMultiJvmSpec extends MultiNodeConfig {
     """))
 
   class Settings(conf: Config) {
-    val testConfig = conf.getConfig("akka.test.cluster-stress-spec")
+    private val testConfig = conf.getConfig("akka.test.cluster-stress-spec")
+    import testConfig._
 
-    val numberOfNodesFactor = testConfig.getInt("nr-of-nodes-factor")
-    val totalNumberOfNodes = testConfig.getInt("nr-of-nodes") * numberOfNodesFactor ensuring (
+    private def getDuration(name: String): FiniteDuration = Duration(getMilliseconds(name), MILLISECONDS)
+
+    val numberOfNodesFactor = getInt("nr-of-nodes-factor")
+    val totalNumberOfNodes = getInt("nr-of-nodes") * numberOfNodesFactor ensuring (
       _ >= 10, "nr-of-nodes must be >= 10")
-    val numberOfSeedNodes = testConfig.getInt("nr-of-seed-nodes") // not multiplied by numberOfNodesFactor
+    val numberOfSeedNodes = getInt("nr-of-seed-nodes") // not multiplied by numberOfNodesFactor
     val numberOfNodesJoiningToSeedNodesInitially =
-      testConfig.getInt("nr-of-nodes-joining-to-seed-initally") * numberOfNodesFactor
+      getInt("nr-of-nodes-joining-to-seed-initally") * numberOfNodesFactor
     val numberOfNodesJoiningOneByOneSmall =
-      testConfig.getInt("nr-of-nodes-joining-one-by-one-small") * numberOfNodesFactor
+      getInt("nr-of-nodes-joining-one-by-one-small") * numberOfNodesFactor
     val numberOfNodesJoiningOneByOneLarge =
-      testConfig.getInt("nr-of-nodes-joining-one-by-one-large") * numberOfNodesFactor
+      getInt("nr-of-nodes-joining-one-by-one-large") * numberOfNodesFactor
     val numberOfNodesJoiningToOneNode =
-      testConfig.getInt("nr-of-nodes-joining-to-one") * numberOfNodesFactor
+      getInt("nr-of-nodes-joining-to-one") * numberOfNodesFactor
     val numberOfNodesJoiningToSeedNodes =
-      testConfig.getInt("nr-of-nodes-joining-to-seed") * numberOfNodesFactor
+      getInt("nr-of-nodes-joining-to-seed") * numberOfNodesFactor
     val numberOfNodesLeavingOneByOneSmall =
-      testConfig.getInt("nr-of-nodes-leaving-one-by-one-small") * numberOfNodesFactor
+      getInt("nr-of-nodes-leaving-one-by-one-small") * numberOfNodesFactor
     val numberOfNodesLeavingOneByOneLarge =
-      testConfig.getInt("nr-of-nodes-leaving-one-by-one-large") * numberOfNodesFactor
+      getInt("nr-of-nodes-leaving-one-by-one-large") * numberOfNodesFactor
     val numberOfNodesLeaving =
-      testConfig.getInt("nr-of-nodes-leaving") * numberOfNodesFactor
+      getInt("nr-of-nodes-leaving") * numberOfNodesFactor
     val numberOfNodesShutdownOneByOneSmall =
-      testConfig.getInt("nr-of-nodes-shutdown-one-by-one-small") * numberOfNodesFactor
+      getInt("nr-of-nodes-shutdown-one-by-one-small") * numberOfNodesFactor
     val numberOfNodesShutdownOneByOneLarge =
-      testConfig.getInt("nr-of-nodes-shutdown-one-by-one-large") * numberOfNodesFactor
+      getInt("nr-of-nodes-shutdown-one-by-one-large") * numberOfNodesFactor
     val numberOfNodesShutdown =
-      testConfig.getInt("nr-of-nodes-shutdown") * numberOfNodesFactor
+      getInt("nr-of-nodes-shutdown") * numberOfNodesFactor
 
-    val workBatchSize = testConfig.getInt("work-batch-size")
-    val workBatchInterval = Duration(testConfig.getMilliseconds("work-batch-interval"), MILLISECONDS)
-    val payloadSize = testConfig.getInt("payload-size")
-    val normalThroughputDuration = Duration(testConfig.getMilliseconds("normal-throughput-duration"), MILLISECONDS)
-    val highThroughputDuration = Duration(testConfig.getMilliseconds("high-throughput-duration"), MILLISECONDS)
-    val reportMetricsInterval = Duration(testConfig.getMilliseconds("report-metrics-interval"), MILLISECONDS)
+    val workBatchSize = getInt("work-batch-size")
+    val workBatchInterval = Duration(getMilliseconds("work-batch-interval"), MILLISECONDS)
+    val payloadSize = getInt("payload-size")
+    val durationFactor = getInt("duration-factor")
+    val normalThroughputDuration = getDuration("normal-throughput-duration") * durationFactor
+    val highThroughputDuration = getDuration("high-throughput-duration") * durationFactor
+    val supervisionDuration = getDuration("supervision-duration") * durationFactor
+    val reportMetricsInterval = getDuration("report-metrics-interval")
 
     require(numberOfSeedNodes + numberOfNodesJoiningToSeedNodesInitially + numberOfNodesJoiningOneByOneSmall +
       numberOfNodesJoiningOneByOneLarge + numberOfNodesJoiningToOneNode + numberOfNodesJoiningToSeedNodes <= totalNumberOfNodes,
@@ -310,11 +323,40 @@ object StressMultiJvmSpec extends MultiNodeConfig {
     def receive = Actor.emptyBehavior
   }
 
+  class Supervisor extends Actor {
+
+    var restartCount = 0
+
+    override val supervisorStrategy =
+      OneForOneStrategy(maxNrOfRetries = 5, withinTimeRange = 1 minute) {
+        case _: Exception ⇒
+          restartCount += 1
+          Restart
+      }
+
+    def receive = {
+      case props: Props     ⇒ context.actorOf(props)
+      case e: Exception     ⇒ context.children foreach { _ ! e }
+      case GetChildrenCount ⇒ sender ! ChildrenCount(context.children.size, restartCount)
+      case ResetRestartCount ⇒
+        require(context.children.isEmpty,
+          s"ResetChildrenCount not allowed when children exists, [${context.children.size}]")
+        restartCount = 0
+    }
+  }
+
+  class RemoteChild extends Actor {
+    def receive = {
+      case e: Exception ⇒ throw e
+    }
+  }
+
   case object Begin
   case object End
   case object RetryTick
   case object ReportTick
   case object SendBatch
+
   type JobId = Long
   case class Job(id: JobId, payload: Any)
   case class Ack(id: JobId)
@@ -323,6 +365,10 @@ object StressMultiJvmSpec extends MultiNodeConfig {
     def droppedCount: Long = sendCount - ackCount
     def messagesPerSecond: Double = ackCount * 1000.0 / duration.toMillis
   }
+
+  case object GetChildrenCount
+  case class ChildrenCount(numberOfChildren: Int, numberOfChildRestarts: Int)
+  case object ResetRestartCount
 
 }
 
@@ -342,7 +388,7 @@ class StressMultiJvmNode13 extends StressSpec
 
 abstract class StressSpec
   extends MultiNodeSpec(StressMultiJvmSpec)
-  with MultiNodeClusterSpec with BeforeAndAfterEach {
+  with MultiNodeClusterSpec with BeforeAndAfterEach with ImplicitSender {
 
   import StressMultiJvmSpec._
   import ClusterEvent._
@@ -354,6 +400,11 @@ abstract class StressSpec
   var usedRoles = 0
 
   override def beforeEach(): Unit = { step += 1 }
+
+  override def muteLog(sys: ActorSystem = system): Unit = {
+    super.muteLog(sys)
+    sys.eventStream.publish(Mute(EventFilter[RuntimeException](pattern = ".*Simulated exception.*")))
+  }
 
   val seedNodes = roles.take(numberOfSeedNodes)
 
@@ -465,7 +516,6 @@ abstract class StressSpec
       val expectedRef = system.actorFor(RootActorPath(removeAddress) / "user" / "watchee")
       expectMsgPF(remaining) {
         case Terminated(`expectedRef`) ⇒ true
-        case x                         ⇒ println("## got: " + x + " expected " + expectedRef); false
       }
     }
     enterBarrier("watch-verified-" + step)
@@ -549,6 +599,42 @@ abstract class StressSpec
     workResult
   }
 
+  def exerciseSupervision(title: String, duration: FiniteDuration): Unit =
+    within(duration + 10.seconds) {
+      val supervisor = system.actorOf(Props[Supervisor], "supervisor")
+      while (remaining > 10.seconds) {
+        createResultAggregator(title, usedRoles)
+
+        reportResult {
+          roles.take(usedRoles) foreach { r ⇒
+            supervisor ! Props[RemoteChild].withDeploy(Deploy(scope = RemoteScope(address(r))))
+          }
+          supervisor ! GetChildrenCount
+          expectMsgType[ChildrenCount] must be(ChildrenCount(usedRoles, 0))
+
+          1 to 5 foreach { _ ⇒ supervisor ! new RuntimeException("Simulated exception") }
+          awaitCond {
+            supervisor ! GetChildrenCount
+            val c = expectMsgType[ChildrenCount]
+            c == ChildrenCount(usedRoles, 5 * usedRoles)
+          }
+
+          // after 5 restart attempts the children should be stopped
+          supervisor ! new RuntimeException("Simulated exception")
+          awaitCond {
+            supervisor ! GetChildrenCount
+            val c = expectMsgType[ChildrenCount]
+            // zero children
+            c == ChildrenCount(0, 6 * usedRoles)
+          }
+          supervisor ! ResetRestartCount
+
+        }
+
+        awaitClusterResult
+      }
+    }
+
   "A cluster under stress" must {
 
     "join seed nodes" taggedAs LongRunningTest in {
@@ -609,6 +695,11 @@ abstract class StressSpec
         workResult.sendCount must be > (0L)
         workResult.ackCount must be > (0L)
       }
+      enterBarrier("after-" + step)
+    }
+
+    "excercise supervision" taggedAs LongRunningTest in {
+      exerciseSupervision("excercise supervision", supervisionDuration)
       enterBarrier("after-" + step)
     }
 
