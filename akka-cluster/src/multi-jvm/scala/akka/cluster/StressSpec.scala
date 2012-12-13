@@ -25,6 +25,7 @@ import akka.routing.CurrentRoutees
 import akka.routing.RouterRoutees
 import akka.actor.PoisonPill
 import com.typesafe.config.Config
+import akka.actor.RootActorPath
 
 object StressMultiJvmSpec extends MultiNodeConfig {
 
@@ -305,6 +306,10 @@ object StressMultiJvmSpec extends MultiNodeConfig {
     }
   }
 
+  class Watchee extends Actor {
+    def receive = Actor.emptyBehavior
+  }
+
   case object Begin
   case object End
   case object RetryTick
@@ -436,9 +441,17 @@ abstract class StressSpec
     val currentRoles = roles.take(usedRoles - 1)
     createResultAggregator(s"${if (shutdown) "shutdown" else "remove"} one from ${usedRoles} nodes cluster", currentRoles.size)
     val removeRole = roles(usedRoles - 1)
+    val removeAddress = address(removeRole)
     runOn(removeRole) {
+      system.actorOf(Props[Watchee], "watchee")
       if (!shutdown) cluster.leave(myself)
     }
+    enterBarrier("watchee-created-" + step)
+    runOn(roles.head) {
+      watch(system.actorFor(node(removeRole) / "user" / "watchee"))
+    }
+    enterBarrier("watch-estabilished-" + step)
+
     runOn(currentRoles: _*) {
       reportResult {
         runOn(roles.head) {
@@ -447,6 +460,16 @@ abstract class StressSpec
         awaitUpConvergence(currentRoles.size, timeout = remaining)
       }
     }
+
+    runOn(roles.head) {
+      val expectedRef = system.actorFor(RootActorPath(removeAddress) / "user" / "watchee")
+      expectMsgPF(remaining) {
+        case Terminated(`expectedRef`) ⇒ true
+        case x                         ⇒ println("## got: " + x + " expected " + expectedRef); false
+      }
+    }
+    enterBarrier("watch-verified-" + step)
+
     awaitClusterResult
     enterBarrier("remove-one-" + step)
   }
