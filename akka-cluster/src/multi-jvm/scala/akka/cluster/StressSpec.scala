@@ -15,6 +15,7 @@ import akka.actor.Props
 import akka.actor.Terminated
 import akka.cluster.StandardMetrics.Cpu
 import akka.cluster.StandardMetrics.HeapMemory
+import akka.cluster.ClusterEvent.ClusterMetricsChanged
 import akka.remote.testkit.MultiNodeConfig
 import akka.remote.testkit.MultiNodeSpec
 import akka.routing.FromConfig
@@ -47,6 +48,7 @@ object StressMultiJvmSpec extends MultiNodeConfig {
       work-batch-interval = 2s
       normal-throughput-duration = 30s
       high-throughput-duration = 10s
+      report-metrics-interval = 10s
     }
 
     akka.actor.provider = akka.cluster.ClusterActorRefProvider
@@ -96,13 +98,29 @@ object StressMultiJvmSpec extends MultiNodeConfig {
   case class ClusterResult(
     address: Address,
     duration: Duration,
-    clusterStats: ClusterStats,
-    nodeMetrics: Option[NodeMetrics])
+    clusterStats: ClusterStats)
 
-  class ClusterResultAggregator(title: String, expectedResults: Int) extends Actor with ActorLogging {
+  class ClusterResultAggregator(title: String, expectedResults: Int, reportMetricsInterval: FiniteDuration) extends Actor with ActorLogging {
+    val cluster = Cluster(context.system)
     var results = Vector.empty[ClusterResult]
+    var nodeMetrics = Set.empty[NodeMetrics]
+
+    import context.dispatcher
+    val reportMetricsTask = context.system.scheduler.schedule(
+      reportMetricsInterval, reportMetricsInterval, self, ReportTick)
+
+    // subscribe to ClusterMetricsChanged, re-subscribe when restart
+    override def preStart(): Unit = cluster.subscribe(self, classOf[ClusterMetricsChanged])
+    override def postStop(): Unit = {
+      cluster.unsubscribe(self)
+      reportMetricsTask.cancel()
+      super.postStop()
+    }
 
     def receive = {
+      case ClusterMetricsChanged(clusterMetrics) ⇒ nodeMetrics = clusterMetrics
+      case ReportTick ⇒
+        log.info("[{}] in progress\n{}", title, formatMetrics)
       case r: ClusterResult ⇒
         results :+= r
         if (results.size == expectedResults) {
@@ -124,24 +142,22 @@ object StressMultiJvmSpec extends MultiNodeConfig {
     def formatMetrics: String = {
       import akka.cluster.Member.addressOrdering
       formatMetricsHeader + "\n" +
-        results.sortBy(_.address).map(r ⇒ r.address + "\t" + formatMetricsLine(r.nodeMetrics)).mkString("\n")
+        nodeMetrics.toSeq.sortBy(_.address).map(m ⇒ m.address + "\t" + formatMetricsLine(m)).mkString("\n")
     }
 
     def formatMetricsHeader: String = "Node\tHeap (MB)\tCPU (%)\tLoad"
 
-    def formatMetricsLine(nodeMetricsOption: Option[NodeMetrics]): String = nodeMetricsOption match {
-      case None ⇒ "N/A\tN/A\tN/A"
-      case Some(nodeMetrics) ⇒
+    def formatMetricsLine(nodeMetrics: NodeMetrics): String = {
+      (nodeMetrics match {
+        case HeapMemory(address, timestamp, used, committed, max) ⇒
+          (used.doubleValue / 1024 / 1024).formatted("%.2f")
+        case _ ⇒ ""
+      }) + "\t" +
         (nodeMetrics match {
-          case HeapMemory(address, timestamp, used, committed, max) ⇒
-            (used.doubleValue / 1024 / 1024).formatted("%.2f")
-          case _ ⇒ ""
-        }) + "\t" +
-          (nodeMetrics match {
-            case Cpu(address, timestamp, loadOption, cpuOption, processors) ⇒
-              format(cpuOption) + "\t" + format(loadOption)
-            case _ ⇒ "N/A\tN/A"
-          })
+          case Cpu(address, timestamp, loadOption, cpuOption, processors) ⇒
+            format(cpuOption) + "\t" + format(loadOption)
+          case _ ⇒ "N/A\tN/A"
+        })
     }
 
     def format(opt: Option[Double]) = opt match {
@@ -315,6 +331,7 @@ abstract class StressSpec
     val workBatchInterval = Duration(testConfig.getMilliseconds("work-batch-interval"), MILLISECONDS)
     val normalThroughputDuration = Duration(testConfig.getMilliseconds("normal-throughput-duration"), MILLISECONDS)
     val highThroughputDuration = Duration(testConfig.getMilliseconds("high-throughput-duration"), MILLISECONDS)
+    val reportMetricsInterval = Duration(testConfig.getMilliseconds("report-metrics-interval"), MILLISECONDS)
 
     require(numberOfSeedNodes + numberOfNodesJoiningToSeedNodesInitially + numberOfNodesJoiningOneByOneSmall +
       numberOfNodesJoiningOneByOneLarge + numberOfNodesJoiningToOneNode + numberOfNodesJoiningToSeedNodes <= totalNumberOfNodes,
@@ -341,7 +358,8 @@ abstract class StressSpec
 
   def createResultAggregator(title: String, expectedResults: Int): Unit = {
     runOn(roles.head) {
-      system.actorOf(Props(new ClusterResultAggregator(title, expectedResults)), "result" + step)
+      system.actorOf(Props(new ClusterResultAggregator(title, expectedResults, reportMetricsInterval)),
+        name = "result" + step)
     }
     enterBarrier("result-aggregator-created-" + step)
   }
@@ -455,10 +473,7 @@ abstract class StressSpec
     val returnValue = thunk
 
     val duration = (System.nanoTime - startTime).nanos
-    val nodeMetrics = clusterView.clusterMetrics.collectFirst {
-      case m if (m.address == cluster.selfAddress) ⇒ m
-    }
-    clusterResultAggregator ! ClusterResult(cluster.selfAddress, duration, clusterView.latestStats, nodeMetrics)
+    clusterResultAggregator ! ClusterResult(cluster.selfAddress, duration, clusterView.latestStats)
     returnValue
   }
 
