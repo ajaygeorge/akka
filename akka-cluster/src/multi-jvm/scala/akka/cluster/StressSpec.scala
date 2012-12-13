@@ -6,6 +6,7 @@ package akka.cluster
 import language.postfixOps
 import scala.concurrent.duration._
 import scala.concurrent.forkjoin.ThreadLocalRandom
+import scala.collection.immutable
 import org.scalatest.BeforeAndAfterEach
 import com.typesafe.config.ConfigFactory
 import akka.actor.Actor
@@ -19,6 +20,8 @@ import akka.actor.SupervisorStrategy._
 import akka.cluster.StandardMetrics.Cpu
 import akka.cluster.StandardMetrics.HeapMemory
 import akka.cluster.ClusterEvent.ClusterMetricsChanged
+import akka.cluster.ClusterEvent.CurrentClusterState
+import akka.cluster.ClusterEvent.MemberEvent
 import akka.remote.testkit.MultiNodeConfig
 import akka.remote.testkit.MultiNodeSpec
 import akka.routing.FromConfig
@@ -159,6 +162,10 @@ object StressMultiJvmSpec extends MultiNodeConfig {
   // FIXME configurable number of nodes
   for (n ← 1 to 13) role("node-" + n)
 
+  implicit class FormattedDouble(val d: Double) extends AnyVal {
+    def form: String = d.formatted("%.2f")
+  }
+
   case class ClusterResult(
     address: Address,
     duration: Duration,
@@ -168,6 +175,10 @@ object StressMultiJvmSpec extends MultiNodeConfig {
     val cluster = Cluster(context.system)
     var results = Vector.empty[ClusterResult]
     var nodeMetrics = Set.empty[NodeMetrics]
+    var phiValuesObservedByNode = {
+      import akka.cluster.Member.addressOrdering
+      immutable.SortedMap.empty[Address, Set[PhiValue]]
+    }
 
     import context.dispatcher
     val reportMetricsTask = context.system.scheduler.schedule(
@@ -183,14 +194,16 @@ object StressMultiJvmSpec extends MultiNodeConfig {
 
     def receive = {
       case ClusterMetricsChanged(clusterMetrics) ⇒ nodeMetrics = clusterMetrics
+      case PhiResult(from, phiValues)            ⇒ phiValuesObservedByNode += from -> phiValues
       case ReportTick ⇒
-        log.info("[{}] in progress\n{}", title, formatMetrics)
+        log.info(s"[${title}] in progress\n${formatMetrics}\n${formatPhi}")
       case r: ClusterResult ⇒
         results :+= r
         if (results.size == expectedResults) {
-          log.info("[{}] completed in [{}] ms\n{}\n{}", title, maxDuration.toMillis, totalClusterStats, formatMetrics)
+          log.info(s"[${title}] completed in [${maxDuration.toMillis}] ms\n${totalClusterStats}\n${formatMetrics}\n${formatPhi}")
           context stop self
         }
+      case _: CurrentClusterState ⇒
     }
 
     def maxDuration = results.map(_.duration).max
@@ -214,7 +227,7 @@ object StressMultiJvmSpec extends MultiNodeConfig {
     def formatMetricsLine(nodeMetrics: NodeMetrics): String = {
       (nodeMetrics match {
         case HeapMemory(address, timestamp, used, committed, max) ⇒
-          (used.doubleValue / 1024 / 1024).formatted("%.2f")
+          (used.doubleValue / 1024 / 1024).form
         case _ ⇒ ""
       }) + "\t" +
         (nodeMetrics match {
@@ -226,7 +239,65 @@ object StressMultiJvmSpec extends MultiNodeConfig {
 
     def format(opt: Option[Double]) = opt match {
       case None    ⇒ "N/A"
-      case Some(x) ⇒ x.formatted("%.2f")
+      case Some(x) ⇒ x.form
+    }
+
+    def formatPhi: String = {
+      if (phiValuesObservedByNode.isEmpty) ""
+      else {
+        import akka.cluster.Member.addressOrdering
+        val lines =
+          for {
+            (monitor, phiValues) ← phiValuesObservedByNode
+            phi ← phiValues.toSeq.sortBy(_.address)
+          } yield formatPhiLine(monitor, phi.address, phi)
+
+        formatPhiHeader + "\n" + lines.mkString("\n")
+      }
+    }
+
+    def formatPhiHeader: String = "Monitor\tSubject\tcount phi > 1.0\tcount\tmax phi"
+
+    def formatPhiLine(monitor: Address, subject: Address, phi: PhiValue): String = {
+      monitor + "\t" + subject + "\t" + phi.countAboveOne + "\t" + phi.count + "\t" + phi.max.form
+    }
+  }
+
+  class PhiObserver extends Actor with ActorLogging {
+    val cluster = Cluster(context.system)
+    val fd = cluster.failureDetector.asInstanceOf[AccrualFailureDetector]
+    var reportTo: Option[ActorRef] = None
+    var phiByNode = Map.empty[Address, PhiValue].withDefault(address ⇒ PhiValue(address, 0, 0, 0.0))
+    var nodes = Set.empty[Address]
+
+    import context.dispatcher
+    val checkPhiTask = context.system.scheduler.schedule(
+      1.second, 1.second, self, PhiTick)
+
+    // subscribe to MemberEvent, re-subscribe when restart
+    override def preStart(): Unit = cluster.subscribe(self, classOf[MemberEvent])
+    override def postStop(): Unit = {
+      cluster.unsubscribe(self)
+      checkPhiTask.cancel()
+      super.postStop()
+    }
+
+    def receive = {
+      case PhiTick ⇒
+        nodes foreach { node ⇒
+          val previous = phiByNode(node)
+          val φ = fd.phi(node)
+          if (φ > 0) {
+            val aboveOne = if (!φ.isInfinite && φ > 1.0) 1 else 0
+            phiByNode += node -> PhiValue(node, previous.countAboveOne + aboveOne, previous.count + 1,
+              math.max(previous.max, φ))
+          }
+        }
+        reportTo foreach { _ ! PhiResult(cluster.selfAddress, phiByNode.values.toSet) }
+      case state: CurrentClusterState ⇒
+        nodes = state.members.map(_.address) ++ state.unreachable.map(_.address)
+      case memberEvent: MemberEvent ⇒ nodes += memberEvent.member.address
+      case a: ActorRef              ⇒ reportTo = Some(a)
     }
   }
 
@@ -355,7 +426,9 @@ object StressMultiJvmSpec extends MultiNodeConfig {
   case object End
   case object RetryTick
   case object ReportTick
-  case object SendBatch
+  case object PhiTick
+  case class PhiResult(from: Address, phiValues: Set[PhiValue])
+  case class PhiValue(address: Address, countAboveOne: Int, count: Int, max: Double)
 
   type JobId = Long
   case class Job(id: JobId, payload: Any)
@@ -365,6 +438,7 @@ object StressMultiJvmSpec extends MultiNodeConfig {
     def droppedCount: Long = sendCount - ackCount
     def messagesPerSecond: Double = ackCount * 1000.0 / duration.toMillis
   }
+  case object SendBatch
 
   case object GetChildrenCount
   case class ChildrenCount(numberOfChildren: Int, numberOfChildRestarts: Int)
@@ -423,9 +497,12 @@ abstract class StressSpec
         name = "result" + step)
     }
     enterBarrier("result-aggregator-created-" + step)
+    phiObserver ! clusterResultAggregator
   }
 
   def clusterResultAggregator: ActorRef = system.actorFor(node(roles.head) / "user" / ("result" + step))
+
+  lazy val phiObserver = system.actorOf(Props[PhiObserver], "phiObserver")
 
   def awaitClusterResult: Unit = {
     runOn(roles.head) {
@@ -592,7 +669,7 @@ abstract class StressSpec
     val m = master
     val workResult = expectMsgType[WorkResult]
     log.info("{} result, [{}] msg/s, dropped [{}] of [{}] msg", m.path.name,
-      workResult.messagesPerSecond.formatted("%.2f"),
+      workResult.messagesPerSecond.form,
       workResult.droppedCount, workResult.sendCount)
     watch(m)
     expectMsgPF(remaining) { case Terminated(`m`) ⇒ true }
