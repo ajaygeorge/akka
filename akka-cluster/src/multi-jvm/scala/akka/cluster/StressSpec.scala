@@ -2,39 +2,35 @@
  *  Copyright (C) 2009-2012 Typesafe Inc. <http://www.typesafe.com>
  */
 package akka.cluster
-
 import language.postfixOps
+import scala.collection.immutable
 import scala.concurrent.duration._
 import scala.concurrent.forkjoin.ThreadLocalRandom
-import scala.collection.immutable
 import org.scalatest.BeforeAndAfterEach
+import com.typesafe.config.Config
 import com.typesafe.config.ConfigFactory
 import akka.actor.Actor
 import akka.actor.ActorLogging
 import akka.actor.ActorRef
+import akka.actor.ActorSystem
 import akka.actor.Address
-import akka.actor.Props
-import akka.actor.Terminated
+import akka.actor.Deploy
 import akka.actor.OneForOneStrategy
+import akka.actor.Props
+import akka.actor.RootActorPath
 import akka.actor.SupervisorStrategy._
-import akka.cluster.StandardMetrics.Cpu
-import akka.cluster.StandardMetrics.HeapMemory
+import akka.actor.Terminated
 import akka.cluster.ClusterEvent.ClusterMetricsChanged
 import akka.cluster.ClusterEvent.CurrentClusterState
 import akka.cluster.ClusterEvent.MemberEvent
+import akka.cluster.StandardMetrics.Cpu
+import akka.cluster.StandardMetrics.HeapMemory
+import akka.remote.RemoteScope
 import akka.remote.testkit.MultiNodeConfig
 import akka.remote.testkit.MultiNodeSpec
 import akka.routing.FromConfig
 import akka.testkit._
 import akka.testkit.TestEvent._
-import akka.routing.CurrentRoutees
-import akka.routing.RouterRoutees
-import akka.actor.PoisonPill
-import com.typesafe.config.Config
-import akka.actor.RootActorPath
-import akka.actor.Deploy
-import akka.remote.RemoteScope
-import akka.actor.ActorSystem
 
 object StressMultiJvmSpec extends MultiNodeConfig {
 
@@ -478,6 +474,7 @@ abstract class StressSpec
   override def muteLog(sys: ActorSystem = system): Unit = {
     super.muteLog(sys)
     sys.eventStream.publish(Mute(EventFilter[RuntimeException](pattern = ".*Simulated exception.*")))
+    // FIXME mute more things
   }
 
   val seedNodes = roles.take(numberOfSeedNodes)
@@ -576,7 +573,8 @@ abstract class StressSpec
     }
     enterBarrier("watchee-created-" + step)
     runOn(roles.head) {
-      watch(system.actorFor(node(removeRole) / "user" / "watchee"))
+      // FIXME enable this check when AdressTerminated is published when MemberRemoved
+      //watch(system.actorFor(node(removeRole) / "user" / "watchee"))
     }
     enterBarrier("watch-estabilished-" + step)
 
@@ -591,9 +589,10 @@ abstract class StressSpec
 
     runOn(roles.head) {
       val expectedRef = system.actorFor(RootActorPath(removeAddress) / "user" / "watchee")
-      expectMsgPF(remaining) {
-        case Terminated(`expectedRef`) ⇒ true
-      }
+      // FIXME enable this check when AdressTerminated is published when MemberRemoved
+      //      expectMsgPF(remaining) {
+      //        case Terminated(`expectedRef`) ⇒ true
+      //      }
     }
     enterBarrier("watch-verified-" + step)
 
@@ -833,7 +832,7 @@ abstract class StressSpec
 
     "end routers that are running while nodes are removed" taggedAs LongRunningTest in within(30.seconds) {
       runOn(roles.take(3): _*) {
-        // FIXME Something is wrong with shutdown, the master/workers are not terminated
+        // FIXME Something is wrong with shutdown, the master/workers are not terminated, see ticket #2797
         //        val m = master
         //        m.tell(End, testActor)
         //        val workResult = awaitWorkResult
