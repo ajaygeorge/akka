@@ -167,8 +167,11 @@ object StressMultiJvmSpec extends MultiNodeConfig {
     duration: Duration,
     clusterStats: ClusterStats)
 
+  case class AggregatedClusterResult(title: String, duration: Duration, clusterStats: ClusterStats)
+
   class ClusterResultAggregator(title: String, expectedResults: Int, reportMetricsInterval: FiniteDuration) extends Actor with ActorLogging {
     val cluster = Cluster(context.system)
+    var reportTo: Option[ActorRef] = None
     var results = Vector.empty[ClusterResult]
     var nodeMetrics = Set.empty[NodeMetrics]
     var phiValuesObservedByNode = {
@@ -196,10 +199,13 @@ object StressMultiJvmSpec extends MultiNodeConfig {
       case r: ClusterResult ⇒
         results :+= r
         if (results.size == expectedResults) {
-          log.info(s"[${title}] completed in [${maxDuration.toMillis}] ms\n${totalClusterStats}\n${formatMetrics}\n${formatPhi}")
+          val aggregated = AggregatedClusterResult(title, maxDuration, totalClusterStats)
+          log.info(s"[${title}] completed in [${aggregated.duration.toMillis}] ms\n${aggregated.clusterStats}\n${formatMetrics}\n${formatPhi}")
+          reportTo foreach { _ ! aggregated }
           context stop self
         }
       case _: CurrentClusterState ⇒
+      case ReportTo(ref)          ⇒ reportTo = ref
     }
 
     def maxDuration = results.map(_.duration).max
@@ -214,23 +220,23 @@ object StressMultiJvmSpec extends MultiNodeConfig {
 
     def formatMetrics: String = {
       import akka.cluster.Member.addressOrdering
-      formatMetricsHeader + "\n" +
-        nodeMetrics.toSeq.sortBy(_.address).map(m ⇒ m.address + "\t" + formatMetricsLine(m)).mkString("\n")
+      (formatMetricsHeader +: (nodeMetrics.toSeq.sortBy(_.address) map formatMetricsLine)).mkString("\n")
     }
 
     def formatMetricsHeader: String = "Node\tHeap (MB)\tCPU (%)\tLoad"
 
     def formatMetricsLine(nodeMetrics: NodeMetrics): String = {
-      (nodeMetrics match {
+      val heap = nodeMetrics match {
         case HeapMemory(address, timestamp, used, committed, max) ⇒
           (used.doubleValue / 1024 / 1024).form
         case _ ⇒ ""
-      }) + "\t" +
-        (nodeMetrics match {
-          case Cpu(address, timestamp, loadOption, cpuOption, processors) ⇒
-            format(cpuOption) + "\t" + format(loadOption)
-          case _ ⇒ "N/A\tN/A"
-        })
+      }
+      val cpuAndLoad = nodeMetrics match {
+        case Cpu(address, timestamp, loadOption, cpuOption, processors) ⇒
+          format(cpuOption) + "\t" + format(loadOption)
+        case _ ⇒ "N/A\tN/A"
+      }
+      s"${nodeMetrics.address}\t${heap}\t${cpuAndLoad}"
     }
 
     def format(opt: Option[Double]) = opt match {
@@ -244,19 +250,38 @@ object StressMultiJvmSpec extends MultiNodeConfig {
         import akka.cluster.Member.addressOrdering
         val lines =
           for {
-            (monitor, phiValues) ← phiValuesObservedByNode
+            (monitor, phiValues) ← phiValuesObservedByNode.toSeq
             phi ← phiValues.toSeq.sortBy(_.address)
           } yield formatPhiLine(monitor, phi.address, phi)
 
-        formatPhiHeader + "\n" + lines.mkString("\n")
+        (formatPhiHeader +: lines).mkString("\n")
       }
     }
 
     def formatPhiHeader: String = "Monitor\tSubject\tcount phi > 1.0\tcount\tmax phi"
 
-    def formatPhiLine(monitor: Address, subject: Address, phi: PhiValue): String = {
-      monitor + "\t" + subject + "\t" + phi.countAboveOne + "\t" + phi.count + "\t" + phi.max.form
+    def formatPhiLine(monitor: Address, subject: Address, phi: PhiValue): String =
+      s"${monitor}\t${subject}\t${phi.countAboveOne}\t${phi.count}\t${phi.max.form}"
+
+  }
+
+  class ClusterResultHistory extends Actor with ActorLogging {
+    var history = Vector.empty[AggregatedClusterResult]
+
+    def receive = {
+      case result: AggregatedClusterResult ⇒
+        history :+= result
+        log.info("Cluster result history\n" + formatHistory)
     }
+
+    def formatHistory: String =
+      (formatHistoryHeader +: (history map formatHistoryLine)).mkString("\n")
+
+    def formatHistoryHeader: String = "title\tduration (ms)\tgossip count\tmerge count"
+
+    def formatHistoryLine(result: AggregatedClusterResult): String =
+      s"${result.title}\t${result.duration.toMillis}\t${result.clusterStats.receivedGossipCount}\t${result.clusterStats.mergeCount}"
+
   }
 
   class PhiObserver extends Actor with ActorLogging {
@@ -293,7 +318,7 @@ object StressMultiJvmSpec extends MultiNodeConfig {
       case state: CurrentClusterState ⇒
         nodes = state.members.map(_.address) ++ state.unreachable.map(_.address)
       case memberEvent: MemberEvent ⇒ nodes += memberEvent.member.address
-      case a: ActorRef              ⇒ reportTo = Some(a)
+      case ReportTo(ref)            ⇒ reportTo = ref
     }
   }
 
@@ -425,6 +450,7 @@ object StressMultiJvmSpec extends MultiNodeConfig {
   case object PhiTick
   case class PhiResult(from: Address, phiValues: Set[PhiValue])
   case class PhiValue(address: Address, countAboveOne: Int, count: Int, max: Double)
+  case class ReportTo(ref: Option[ActorRef])
 
   type JobId = Long
   case class Job(id: JobId, payload: Any)
@@ -488,16 +514,20 @@ abstract class StressSpec
   lazy val createWorker: Unit =
     system.actorOf(Props[Worker], "worker")
 
-  def createResultAggregator(title: String, expectedResults: Int): Unit = {
+  def createResultAggregator(title: String, expectedResults: Int, includeInHistory: Boolean): Unit = {
     runOn(roles.head) {
-      system.actorOf(Props(new ClusterResultAggregator(title, expectedResults, reportMetricsInterval)),
+      val aggregator = system.actorOf(Props(new ClusterResultAggregator(title, expectedResults, reportMetricsInterval)),
         name = "result" + step)
+      if (includeInHistory) aggregator ! ReportTo(Some(clusterResultHistory))
+      else aggregator ! ReportTo(None)
     }
     enterBarrier("result-aggregator-created-" + step)
-    phiObserver ! clusterResultAggregator
+    phiObserver ! ReportTo(Some(clusterResultAggregator))
   }
 
   def clusterResultAggregator: ActorRef = system.actorFor(node(roles.head) / "user" / ("result" + step))
+
+  lazy val clusterResultHistory = system.actorOf(Props[ClusterResultHistory], "resultHistory")
 
   lazy val phiObserver = system.actorOf(Props[PhiObserver], "phiObserver")
 
@@ -520,7 +550,8 @@ abstract class StressSpec
 
   def joinOne(): Unit = within(5.seconds + 2.seconds * (usedRoles + 1)) {
     val currentRoles = roles.take(usedRoles + 1)
-    createResultAggregator(s"join one to ${usedRoles} nodes cluster", currentRoles.size)
+    val title = s"join one to ${usedRoles} nodes cluster"
+    createResultAggregator(title, expectedResults = currentRoles.size, includeInHistory = true)
     runOn(currentRoles: _*) {
       reportResult {
         runOn(currentRoles.last) {
@@ -539,7 +570,7 @@ abstract class StressSpec
       val currentRoles = roles.take(usedRoles + numberOfNodes)
       val joiningRoles = currentRoles.takeRight(numberOfNodes)
       val title = s"join ${numberOfNodes} to ${if (toSeedNodes) "seed nodes" else "one node"}, in ${usedRoles} nodes cluster"
-      createResultAggregator(title, currentRoles.size)
+      createResultAggregator(title, expectedResults = currentRoles.size, includeInHistory = true)
       runOn(currentRoles: _*) {
         reportResult {
           runOn(joiningRoles: _*) {
@@ -564,7 +595,8 @@ abstract class StressSpec
 
   def removeOne(shutdown: Boolean): Unit = within(10.seconds + 2.seconds * (usedRoles - 1)) {
     val currentRoles = roles.take(usedRoles - 1)
-    createResultAggregator(s"${if (shutdown) "shutdown" else "remove"} one from ${usedRoles} nodes cluster", currentRoles.size)
+    val title = s"${if (shutdown) "shutdown" else "remove"} one from ${usedRoles} nodes cluster"
+    createResultAggregator(title, expectedResults = currentRoles.size, includeInHistory = true)
     val removeRole = roles(usedRoles - 1)
     val removeAddress = address(removeRole)
     runOn(removeRole) {
@@ -605,7 +637,7 @@ abstract class StressSpec
       val currentRoles = roles.take(usedRoles - numberOfNodes)
       val removeRoles = roles.slice(currentRoles.size, usedRoles)
       val title = s"${if (shutdown) "shutdown" else "leave"} ${numberOfNodes} in ${usedRoles} nodes cluster"
-      createResultAggregator(title, currentRoles.size)
+      createResultAggregator(title, expectedResults = currentRoles.size, includeInHistory = true)
       runOn(removeRoles: _*) {
         if (!shutdown) cluster.leave(myself)
       }
@@ -635,7 +667,7 @@ abstract class StressSpec
 
   def exerciseRouters(title: String, duration: FiniteDuration, batchInterval: FiniteDuration, expectNoDroppedMessages: Boolean): Unit =
     within(duration + 10.seconds) {
-      createResultAggregator(title, usedRoles)
+      createResultAggregator(title, expectedResults = usedRoles, includeInHistory = false)
 
       val (masterRoles, otherRoles) = roles.take(usedRoles).splitAt(3)
       runOn(masterRoles: _*) {
@@ -679,7 +711,7 @@ abstract class StressSpec
     within(duration + 10.seconds) {
       val supervisor = system.actorOf(Props[Supervisor], "supervisor")
       while (remaining > 10.seconds) {
-        createResultAggregator(title, usedRoles)
+        createResultAggregator(title, expectedResults = usedRoles, includeInHistory = false)
 
         reportResult {
           roles.take(usedRoles) foreach { r ⇒
@@ -718,7 +750,7 @@ abstract class StressSpec
       val otherNodesJoiningSeedNodes = roles.slice(numberOfSeedNodes, numberOfSeedNodes + numberOfNodesJoiningToSeedNodesInitially)
       val size = seedNodes.size + otherNodesJoiningSeedNodes.size
 
-      createResultAggregator("join seed nodes", size)
+      createResultAggregator("join seed nodes", expectedResults = size, includeInHistory = false)
 
       runOn((seedNodes ++ otherNodesJoiningSeedNodes): _*) {
         reportResult {
